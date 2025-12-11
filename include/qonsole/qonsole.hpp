@@ -473,23 +473,17 @@ namespace qonsole {
                 // negative delta = wheel down (scroll forward/down toward latest)
                 int delta = event->angleDelta().y();
                 
-                // convert wheel delta to line count
-                // standard wheel tick is 120 units, we scroll 3 lines per tick
-                int lines = delta; // (delta / 100) * 3;
-
-                if (lines > 0) {
+                if (delta > 0) {
                     // scroll up (backward in history)
-                    for (int i = 0; i < lines; ++i) {
-                        tsm_screen_sb_up(m_screen, 1);
-                        m_scroll_offset++;
-                    }
-                } else if (lines < 0) {
+                    tsm_screen_sb_up(m_screen, 1);
+                    m_scroll_offset += delta;
+
+                } 
+                else if (delta < 0) {
                     // scroll down (forward toward latest)
-                    for (int i = 0; i < -lines; ++i) {
-                        if (m_scroll_offset > 0) {
-                            tsm_screen_sb_down(m_screen, 1);
-                            m_scroll_offset--;
-                        }
+                    if (m_scroll_offset > 0) {
+                        tsm_screen_sb_down(m_screen, delta);
+                        m_scroll_offset -= delta;
                     }
                 }
                 
