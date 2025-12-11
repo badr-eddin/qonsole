@@ -357,6 +357,8 @@ namespace qonsole {
             bool m_is_selecting = false;  // inner state
             bool m_draw_empty_cells = false;
             bool __m_requesting_dump = false;
+            int m_scroll_offset = 0;  // Current scroll position (0 = bottom/latest output)
+            int m_max_scrollback = 1000;  // Maximum lines to keep in scrollback buffer
 
             QString m_screen_content;
 
@@ -390,7 +392,10 @@ namespace qonsole {
                 if (!m_screen)
                     return;
                 
-                draw_cursor(painter);
+                // only draw cursor if we're at the bottom (not scrolled back)
+                if (m_scroll_offset == 0) {
+                    draw_cursor(painter);
+                }
                 
                 painter.setFont(m_font);
                 
@@ -402,6 +407,29 @@ namespace qonsole {
             }
             
             void keyPressEvent(QKeyEvent *event) override {
+                // handle scrolling keys first (don't send to terminal)
+                if (event->key() == Qt::Key_PageUp && event->modifiers() == Qt::ShiftModifier) {
+                    scroll_up(m_lines);  // scroll up one page
+                    return;
+                }
+                if (event->key() == Qt::Key_PageDown && event->modifiers() == Qt::ShiftModifier) {
+                    scroll_down(m_lines);  // scroll down one page
+                    return;
+                }
+                if (event->key() == Qt::Key_Home && event->modifiers() == Qt::ShiftModifier) {
+                    scroll_to_top();
+                    return;
+                }
+                if (event->key() == Qt::Key_End && event->modifiers() == Qt::ShiftModifier) {
+                    scroll_to_bottom();
+                    return;
+                }
+                
+                // any other key press should jump to bottom (follow output)
+                if (m_scroll_offset > 0) {
+                    scroll_to_bottom();
+                }
+
                 reset_selection();
 
                 // translate QKeyEvent to terminal input sequences
@@ -413,7 +441,7 @@ namespace qonsole {
                 }
             }
 
-            void mousePressEvent(QMouseEvent *event) {
+            void mousePressEvent(QMouseEvent *event) override {
                 reset_selection();
 
                 m_selection.active = true;
@@ -421,13 +449,13 @@ namespace qonsole {
 
             }
 
-            void mouseReleaseEvent(QMouseEvent *event) {
+            void mouseReleaseEvent(QMouseEvent *event) override {
                 m_selection.active = false;
                 update();
                 // qDebug() << this->selected_text();
             }
 
-            void mouseMoveEvent(QMouseEvent *event) {
+            void mouseMoveEvent(QMouseEvent *event) override {
                 if (m_selection.active) {
                     m_is_selecting = true;
                     px2pos(event->pos(), m_selection.end_column, m_selection.end_line);
@@ -436,9 +464,37 @@ namespace qonsole {
                 }
             }
             
-            void wheelEvent(QWheelEvent *event) {
-                // TODO: handle scrolling: tsm_screen_scroll_down
-                // TODO: use page up/down with keys
+            void wheelEvent(QWheelEvent *event) override {                
+                if (!m_screen)
+                    return;
+                
+                // get the scroll delta from the wheel event
+                // positive delta = wheel up (scroll backward/up in history)
+                // negative delta = wheel down (scroll forward/down toward latest)
+                int delta = event->angleDelta().y();
+                
+                // convert wheel delta to line count
+                // standard wheel tick is 120 units, we scroll 3 lines per tick
+                int lines = delta; // (delta / 100) * 3;
+
+                if (lines > 0) {
+                    // scroll up (backward in history)
+                    for (int i = 0; i < lines; ++i) {
+                        tsm_screen_sb_up(m_screen, 1);
+                        m_scroll_offset++;
+                    }
+                } else if (lines < 0) {
+                    // scroll down (forward toward latest)
+                    for (int i = 0; i < -lines; ++i) {
+                        if (m_scroll_offset > 0) {
+                            tsm_screen_sb_down(m_screen, 1);
+                            m_scroll_offset--;
+                        }
+                    }
+                }
+                
+                // Repaint to show the new viewport
+                update();
             }
 
             void update_cursor_pos() {
@@ -570,7 +626,6 @@ namespace qonsole {
                 }
                 
                 // Draw background
-                // if selection use selection background color
                 if (iss) {
                     bg = self->m_selection_bg;
                 }
@@ -612,7 +667,12 @@ namespace qonsole {
                 if (m_vte) {
                     tsm_vte_input(m_vte, data.constData(), data.size());
 
-                    update_cursor_pos();
+                    // Only update cursor and auto-scroll if we're at the bottom
+                    if (m_scroll_offset == 0) {
+                        update_cursor_pos();
+                    }
+
+                    update();
                 }
             }
 
@@ -678,6 +738,9 @@ namespace qonsole {
                     return;
                 }
 
+                // set scrollback buffer size (IMPORTANT!)
+                tsm_screen_set_max_sb(m_screen, m_max_scrollback);
+
                 ret = tsm_vte_new(&m_vte, m_screen, write_callback, this, nullptr, nullptr);
                 if (ret < 0) {
                     qWarning() << "Failed to create tsm vte";
@@ -691,6 +754,7 @@ namespace qonsole {
                 }
 
                 setFocusPolicy(Qt::FocusPolicy::StrongFocus);
+                setMouseTracking(true);
 
                 load_default_palette();
             }
@@ -709,6 +773,71 @@ namespace qonsole {
 
                 // reader not deleted, as its set from outside so user must handle that.
             }
+
+
+            void scroll_up(int lines = 1) {
+                if (!m_screen)
+                    return;
+                
+                tsm_screen_sb_up(m_screen, lines);
+                m_scroll_offset += lines;
+                
+                update();
+            }
+
+            void scroll_down(unsigned int lines = 1) {
+                if (!m_screen)
+                    return;
+                
+                // Only scroll down if we're actually scrolled back
+                if (m_scroll_offset > 0) {
+                    // Don't scroll past the bottom
+                    unsigned int actual_lines = (lines > m_scroll_offset) ? m_scroll_offset : lines;
+                    
+                    tsm_screen_sb_down(m_screen, actual_lines);
+                    m_scroll_offset -= actual_lines;
+                }
+                
+                update();
+            }
+
+            void scroll_to_top() {
+                if (!m_screen)
+                    return;
+                
+                // Scroll up by a very large amount to reach the top
+                // libtsm will automatically clamp to the actual buffer size
+                tsm_screen_sb_up(m_screen, m_max_scrollback);
+                m_scroll_offset = m_max_scrollback; // Track approximate position
+                update();
+            }
+
+            void scroll_to_bottom() {
+                if (!m_screen)
+                    return;
+                    
+                tsm_screen_sb_reset(m_screen);
+                m_scroll_offset = 0;
+                update();
+            }
+
+            void set_max_scrollback(unsigned int lines) {
+                m_max_scrollback = lines;
+                
+                if (m_screen) {
+                    // Tell libtsm to limit the scrollback buffer size
+                    tsm_screen_set_max_sb(m_screen, m_max_scrollback);
+                }
+            }
+
+            unsigned int get_scroll_position() const {
+                return m_scroll_offset;
+            }
+
+            unsigned int get_max_scroll() const {
+                return m_max_scrollback;
+            }
+
 
             void px2pos(QPoint p, uint &col, uint &line) {
                 col = p.x() / m_char_width;
@@ -834,49 +963,11 @@ namespace qonsole {
             }
 
             QString get_selected_text() {
-                QString text = dump_screen();
-
-                if (!m_selection.active) return QString();
-
-                QStringList lines = text.split('\n');
-
-                if (m_selection.start_line >= (uint)lines.size() || sel.end_line >= (uint)lines.size())
-                    return QString();
-
-                // Single-line selection
-                if (sel.start_line == sel.end_line) {
-                    const QString &line = lines[sel.start_line];
-                    uint start = qMin(sel.start_column, (uint)line.size());
-                    uint end   = qMin(sel.end_column,   (uint)line.size());
-                    if (end < start) std::swap(start, end);
-                    return line.mid(start, end - start);
-                }
-
-                QStringList out;
-
-                // First line (partial)
-                {
-                    const QString &line = lines[sel.start_line];
-                    uint start = qMin(sel.start_column, (uint)line.size());
-                    out << line.mid(start);
-                }
-
-                // Middle full lines
-                for (uint i = sel.start_line + 1; i < sel.end_line; ++i)
-                    out << lines[i];
-
-                // Last line (partial)
-                {
-                    const QString &line = lines[sel.end_line];
-                    uint end = qMin(sel.end_column, (uint)line.size());
-                    out << line.left(end);
-                }
-
-                return out.join("\n");
+                return "";
             }
 
             QString dump_screen() {
-                
+                return "";
             } 
             
             void set_cursor_style(q_cursor_style qcs) {
