@@ -360,8 +360,6 @@ namespace qonsole {
             int m_scroll_offset = 0;  // Current scroll position (0 = bottom/latest output)
             int m_max_scrollback = 1000;  // Maximum lines to keep in scrollback buffer
 
-            QString m_screen_content;
-
             QColor m_default_fg;
             QColor m_default_bg;
             QColor m_selection_bg;
@@ -657,6 +655,64 @@ namespace qonsole {
                 }
             }
 
+            static int dump_callback(
+                struct tsm_screen *con,
+                uint64_t id,
+                const uint32_t *ch,
+                size_t len,
+                unsigned int width,
+                unsigned int posx,
+                unsigned int posy,
+                const struct tsm_screen_attr *attr,
+                tsm_age_t age,
+                void *data
+            ){
+                Q_UNUSED(con);
+                Q_UNUSED(id);
+                Q_UNUSED(width);
+                Q_UNUSED(attr);
+                Q_UNUSED(age);
+                
+                QString *output = static_cast<QString*>(data);
+                
+                // Calculate current position in output string
+                unsigned int screenWidth = tsm_screen_get_width(con);
+                unsigned int currentPos = posy * (screenWidth + 1) + posx; // +1 for newline
+                
+                // Expand string if needed
+                while (output->length() <= (int)currentPos) {
+                    output->append(' ');
+                }
+                
+                // Convert UCS4 character to QString
+                QString charStr;
+                if (len > 0 && ch != nullptr) {
+                    charStr = QString::fromUcs4(reinterpret_cast<const char32_t*>(ch), static_cast<int>(len));
+                }
+                
+                // Handle empty cells
+                if (charStr.isEmpty()) {
+                    charStr = " ";
+                }
+                
+                // Replace character at position
+                if (posx < screenWidth) {
+                    output->replace(currentPos, charStr.length(), charStr);
+                }
+                
+                // Add newline at end of line
+                if (posx == screenWidth - 1) {
+                    unsigned int newlinePos = posy * (screenWidth + 1) + screenWidth;
+                    if (output->length() <= (int)newlinePos) {
+                        output->append('\n');
+                    } else {
+                        output->replace(newlinePos, 1, "\n");
+                    }
+                }
+                
+                return 0;
+            }
+
             void on_data_ready(QByteArray data) {
                 if (m_vte) {
                     tsm_vte_input(m_vte, data.constData(), data.size());
@@ -719,12 +775,6 @@ namespace qonsole {
             QonsoleWidget(QWidget*parent) : QWidget(parent) {
                 set_font(QFont("Monospace", 14));
 
-                // assuming it is a free widget
-                if (!parent) {
-                    set_vt_size(80, 24);
-                    widget_fit_vt_size();
-                }
-
                 // Initialize libtsm
                 int ret = tsm_screen_new(&m_screen, nullptr, nullptr);
                 if (ret < 0) {
@@ -743,8 +793,10 @@ namespace qonsole {
                     return;
                 }
 
+                // assuming it is a free widget
                 if (!parent) {
-                    resize(800, 500);
+                    set_vt_size(80, 24);
+                    widget_fit_vt_size();
                 }
 
                 setFocusPolicy(Qt::FocusPolicy::StrongFocus);
@@ -815,24 +867,6 @@ namespace qonsole {
                 update();
             }
 
-            void set_max_scrollback(unsigned int lines) {
-                m_max_scrollback = lines;
-                
-                if (m_screen) {
-                    // Tell libtsm to limit the scrollback buffer size
-                    tsm_screen_set_max_sb(m_screen, m_max_scrollback);
-                }
-            }
-
-            unsigned int get_scroll_position() const {
-                return m_scroll_offset;
-            }
-
-            unsigned int get_max_scroll() const {
-                return m_max_scrollback;
-            }
-
-
             void px2pos(QPoint p, uint &col, uint &line) {
                 col = p.x() / m_char_width;
                 line = p.y() / m_char_height;
@@ -902,6 +936,7 @@ namespace qonsole {
                 resize_vt();
             }
 
+
             void set_color_palette(const q_palette plt) {
                 m_palette[0]  = plt.black;
                 m_palette[1]  = plt.red;
@@ -941,14 +976,40 @@ namespace qonsole {
                 reader->start();
             }
 
+            void set_max_scrollback(unsigned int lines) {
+                m_max_scrollback = lines;
+                
+                if (m_screen) {
+                    // Tell libtsm to limit the scrollback buffer size
+                    tsm_screen_set_max_sb(m_screen, m_max_scrollback);
+                }
+            }
+
+            void set_cursor_style(q_cursor_style qcs) {
+                m_qcstyle = qcs;
+            }
+
+            void set_bold(bool s) {
+                m_use_bold = s;
+            }
+    
             // for optimization, empty cells are not drawn by default
             void set_draw_empty_cells(bool s) {
                 m_draw_empty_cells = s;
             }
 
+
             void get_terminal_size(int& cols, int& lines) {
                 cols = m_cols;
                 lines = m_lines;
+            }
+
+            unsigned int get_scroll_position() const {
+                return m_scroll_offset;
+            }
+
+            unsigned int get_max_scroll() const {
+                return m_max_scrollback;
             }
 
             // return where selection starts and ends as a flat
@@ -957,19 +1018,83 @@ namespace qonsole {
             }
 
             QString get_selected_text() {
-                return "";
+                QString screen_dump = dump_screen();
+
+                if (!m_is_selecting)
+                    return QString();
+
+                const uint cols = m_cols;
+
+                uint sl = m_selection.start_line;
+                uint sc = m_selection.start_column;
+                uint el = m_selection.end_line;
+                uint ec = m_selection.end_column;
+
+                if (sl > el || (sl == el && sc > ec)) {
+                    std::swap(sl, el);
+                    std::swap(sc, ec);
+                }
+
+                QString result;
+
+                for (uint line = sl; line <= el; ++line) {
+                    int line_start = line * (cols + 1);
+
+                    if (line_start >= screen_dump.size())
+                        break;
+
+                    uint c_start = (line == sl) ? sc : 0;
+                    uint c_end   = (line == el) ? ec : cols - 1;
+
+                    if (c_start > c_end)
+                        continue;
+
+                    int start = line_start + c_start;
+                    int len   = qMin<int>(c_end - c_start + 1,
+                                        screen_dump.size() - start);
+
+                    if (len > 0)
+                        result += screen_dump.mid(start, len);
+
+                    if (line != el)
+                        result += '\n';
+                }
+
+                return result;
             }
 
             QString dump_screen() {
-                return "";
-            } 
-            
-            void set_cursor_style(q_cursor_style qcs) {
-                m_qcstyle = qcs;
+                if (!m_screen) {
+                    return QString();
+                }
+                
+                unsigned int width = tsm_screen_get_width(m_screen);
+                unsigned int height = tsm_screen_get_height(m_screen);
+                
+                // pre-allocate string with estimated size
+                QString output;
+                output.reserve((width + 1) * height);
+                
+                // initialize output with spaces and newlines
+                for (unsigned int y = 0; y < height; ++y) {
+                    for (unsigned int x = 0; x < width; ++x) {
+                        output.append(' ');
+                    }
+                    output.append('\n');
+                }
+                
+                // draw screen using callback
+                tsm_screen_draw(m_screen, dump_callback, &output);
+                
+                // remove trailing newline if present
+                if (output.endsWith('\n')) {
+                    output.chop(1);
+                }
+                
+                return output;
             }
 
-            void set_bold(bool s) {
-                m_use_bold = s;
-            }
+            // TODO: add a scroll bar, but keep it as user's option
+            
     };
 } // end of qonsole
